@@ -201,7 +201,7 @@ def main():
     model = prepare_model_for_kbit_training(model)
 
     lora = LoraConfig(
-        r=a.lora_r, lora_alpha=2 * a.lora_r, lora_dropout=0.05,
+        r=a.lora_r, lora_alpha=a.lora_r, lora_dropout=0.05,  # alpha=r (احتياط رخيص — ليس حل مشكلة lora_gate الجوهرية: غياب eval)
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
                         "gate_proj", "up_proj", "down_proj"],
         bias="none", task_type="CAUSAL_LM")
@@ -221,6 +221,7 @@ def main():
         save_steps=a.save_steps,
         save_total_limit=3,                  # آخر 3 فقط (ضبط القرص)
         bf16=True,
+        weight_decay=0.01,
         optim="paged_adamw_32bit",
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},

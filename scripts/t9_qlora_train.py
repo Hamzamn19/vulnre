@@ -37,11 +37,17 @@ STATS = {"encoded": 0, "skipped_toolshape": 0}
 
 
 class LiveLossLogger(TrainerCallback):
-    """يوقّع كل خطوة خرج تلقائي بملف JSONL منفصل (متطلب T9)."""
+    """يوقّع كل خطوة خرج تلقائي بملف JSONL منفصل (متطلب T9).
+    منهجية المستخدم: يطبع s/step لحظياً بعد أول خطوات (لا انتظار 15-30) —
+    بايلوت قياس السرعة = --max-steps 8-10 + --logging-steps 1، والحساب من فرق 3→8."""
 
-    def __init__(self, path):
+    PREV = None
+
+    def __init__(self, path, tok_per_step):
         self.path = path
         self.t0 = time.time()
+        self.tok_per_step = tok_per_step
+        self._prev = None
 
     def _write(self, payload):
         with open(self.path, "a", encoding="utf-8") as f:
@@ -49,8 +55,18 @@ class LiveLossLogger(TrainerCallback):
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs and ("loss" in logs or "total_loss" in logs):
-            self._write({"wall_h": (time.time() - self.t0) / 3600.0, **logs,
-                         "step": state.global_step})
+            row = {"wall_h": (time.time() - self.t0) / 3600.0, **logs,
+                   "step": state.global_step}
+            if self._prev is not None:
+                dstep = row["step"] - self._prev["step"]
+                dwall = (row["wall_h"] - self._prev["wall_h"]) * 3600.0
+                if dstep > 0:
+                    sps = dwall / dstep
+                    print(f"[timing] steps {self._prev['step']}→{row['step']}: "
+                          f"{sps:.1f}s/step, {self.tok_per_step/sps:.0f} tok/s "
+                          f"({self.tok_per_step} tok/step)", flush=True)
+            self._prev = row
+            self._write(row)
 
     def on_train_end(self, args, state, control, **kwargs):
         self._write({"event": "train_end", "step": state.global_step,
@@ -257,7 +273,8 @@ def main():
         args=args,
         train_dataset=ds,
         processing_class=tokenizer,
-        callbacks=[LiveLossLogger(os.path.join(a.output, "loss_log.jsonl"))],
+        callbacks=[LiveLossLogger(os.path.join(a.output, "loss_log.jsonl"),
+                                  a.max_length * a.grad_accum)],
     )
     t0 = time.time()
     trainer.train()

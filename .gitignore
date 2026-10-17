@@ -1,15 +1,40 @@
-# أوزان وبيانات ضخمة — خارج الشبكة الأمان (على القرص فقط)
-.venv/
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Massive datasets and model checkpoints (Local disk only)
 data/
 models/
-logs/
+lora_runs/
 wandb/
+checkpoints/
 
-# مستودعات خارجية مستنسخة (لا نتحكم بها)
+# Temporary run logs and compiled caches
+logs/
+unsloth_compiled_cache/
+.pytest_cache/
+
+# Secrets and local credentials (NEVER COMMIT)
+.secrets/
+*.token
+*.key
+*.pem
+.env
+
+# Third-party cloned repositories
 third_party/
 
-# ملفات تشغيل
+# Editor and OS artifacts
 *.swp
+*.swo
+*~
 .DS_Store
+.idea/
+.vscode/

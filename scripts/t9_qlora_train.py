@@ -171,6 +171,10 @@ def main():
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-targets", choices=["all", "qv"], default="all",
                     help="all=7 إسقاطات (الخطي الحالي ~40M بارامتر)؛ qv=إعداد القياس الأصلي 6.72GB")
+    ap.add_argument("--attn", default="sdpa",
+                    help="sdpa | flash_attention_2 | kernels-community/flash-attn2")
+    ap.add_argument("--torch-compile", action="store_true",
+                    help="تفعيل torch.compile (رخيص التجربة — قد يفشل مع bnb)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-steps", type=int, default=250)
     ap.add_argument("--dry-run", action="store_true", help="التحقق من القالب والبيانات فقط")
@@ -198,7 +202,8 @@ def main():
         bnb_4bit_use_double_quant=True,
     )
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, quantization_config=bnb, device_map="auto", trust_remote_code=True)
+        MODEL_ID, quantization_config=bnb, device_map="auto", trust_remote_code=True,
+        attn_implementation=a.attn)
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model)
 
@@ -232,6 +237,7 @@ def main():
         gradient_checkpointing_kwargs={"use_reentrant": False},
         max_length=a.max_length,
         packing=True,
+        torch_compile=a.torch_compile,
         report_to="none",
         remove_unused_columns=False,
         seed=a.seed,

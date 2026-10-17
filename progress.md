@@ -158,3 +158,14 @@
 - سكربت: `--attn` + `--torch-compile` أضيفا (commit مستقل). baseline سصق تمثيل: **122 s/خطوة (2/دق) = 268.6 tok/s ideiasي** (من دليلة الجدञ bar: الخطوة 12→28 في 1952s/16).
 - 🟢 بايلوت F1 يعمل الآن `vulnre-t9-fa2`: **متغير واحد = attn فقط** — نفس كل بتّ: qv + 4096 + 30 خطوة + accum8 + segs، (RuntimeMaxSec=7200 احتياطاً أوسع لأن القتال 3600 كان يقدّ في القياس).
 - مصير النتيجة تقياسها من فقد wall بين صفوف 15و30 في loss_log (إبعاد الوقت الاستمراري) = steady s/step بللمكوين القيسي.
+
+## 2026-10-17 — موافقة جديدة: قلب المحرك إلى unsloth (أقوى تغيير متاح، وتعليمة المستخدم)
+- تعليماته: أوقف ملاحقة flash-attn-2/torch.compile → حوّل t9_qlora_train.py إلى **unsloth.FastLanguageModel + use_gradient_checkpointing="unsloth"** (نفس مسار t5_context_unsloth الناجح) → إعادة نفس البايلوت (qv+4096، 30 خطوة) وقارن VRAM وtok/s. توقعه: **~2x** سرعة + هامش ذاكرة يفتح احتمال 8K.
+- ✅ التنفيذ (commit ‏«24+/26−»):
+  - `import unsloth` **أول الاستيرادات** (قبل transformers/trl — شرط الpatching).
+  - FastLanguageModel.from_pretrained(max_seq_length=max_length, dtype=None, load_in_4bit=True) + get_peft_model(r16, alpha=r, dropout=0, use_gradient_checkpointing="unsloth", qv/all حسب --lora-targets).
+  - **إزالة** gradient_checkpointing من SFTConfig (تطبيق مزدوج يضر)، إزالة AutoTokenizer/peft/typeof HF loader القديم (unsloth يعيد tokenizer). unsloth 2026.10.6 موجود بالبيئة منذ البداية — هذا أغفلنا أنه مثبت وسليم لبيئتنا.
+  - dry-run نجاح (probes نفس القالب).
+- ⏹ F1 (kernels flash-attn2) **وُقف بتعليمه** (كان will dead أصلاً — kernels لم توافق ABI torch2.14/cu130 على الأرجح).
+- 🟢 بايلوت **T9-uns1 يعمل** (`vulnre-t9-uns1`, 7200s): متغير واحد = محرّك التنفيذ (HF/peft → unsloth). كل البتات مطابقة B1: qv+4096+accum8+120K سجل+segs+paged32.
+- 🖇 وسيلлетا القياس الموحدة: s/step من فارق wall بين صفوف 15و30؛ VRAM من nvidia-smi أثناء الخطوات. **Baseline: 122 s/خطوة = 268.6 tok/s مع 9.18GB.**

@@ -41,8 +41,6 @@ class LiveLossLogger(TrainerCallback):
     منهجية المستخدم: يطبع s/step لحظياً بعد أول خطوات (لا انتظار 15-30) —
     بايلوت قياس السرعة = --max-steps 8-10 + --logging-steps 1، والحساب من فرق 3→8."""
 
-    PREV = None
-
     def __init__(self, path, tok_per_step):
         self.path = path
         self.t0 = time.time()
@@ -54,19 +52,28 @@ class LiveLossLogger(TrainerCallback):
             f.write(json.dumps(payload, ensure_ascii=False, default=float) + "\n")
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs and ("loss" in logs or "total_loss" in logs):
-            row = {"wall_h": (time.time() - self.t0) / 3600.0, **logs,
-                   "step": state.global_step}
-            if self._prev is not None:
-                dstep = row["step"] - self._prev["step"]
-                dwall = (row["wall_h"] - self._prev["wall_h"]) * 3600.0
-                if dstep > 0:
-                    sps = dwall / dstep
-                    print(f"[timing] steps {self._prev['step']}→{row['step']}: "
-                          f"{sps:.1f}s/step, {self.tok_per_step/sps:.0f} tok/s "
-                          f"({self.tok_per_step} tok/step)", flush=True)
-            self._prev = row
-            self._write(row)
+        if not logs:
+            return
+        wall = (time.time() - self.t0) / 3600.0
+        # صفوف eval غير مقصودة في توقيت التدريب — تسجَّل بخفة وتطبع
+        if "eval_loss" in logs and "loss" not in logs:
+            print(f"[eval@{state.global_step}] eval_loss={logs.get('eval_loss', 0):.4f}", flush=True)
+            self._write({"kind": "eval", "wall_h": wall, "step": state.global_step,
+                         **logs})
+            return
+        if "loss" not in logs and "total_loss" not in logs:
+            return
+        row = {"kind": "train", "wall_h": wall, **logs, "step": state.global_step}
+        if self._prev is not None:
+            dstep = row["step"] - self._prev["step"]
+            dwall = (row["wall_h"] - self._prev["wall_h"]) * 3600.0
+            if dstep > 0:
+                sps = dwall / dstep
+                print(f"[timing] steps {self._prev['step']}→{row['step']}: "
+                      f"{sps:.1f}s/step, {self.tok_per_step/sps:.0f} tok/s "
+                      f"({self.tok_per_step} tok/step)", flush=True)
+        self._prev = row
+        self._write(row)
 
     def on_train_end(self, args, state, control, **kwargs):
         self._write({"event": "train_end", "step": state.global_step,
@@ -112,16 +119,36 @@ def template_record(messages):
     return BOS + seq if seq else None
 
 
-def load_mix(parquet, token_budget, max_records, seed):
-    """يرجّع Dataset من Parquet مع 'text' مُصيَّر ومحذوف تذبذب الحجم (≤24K chars)."""
+def load_mix(parquet, token_budget, max_records, seed, eval_frac=0.0, max_eval_records=0):
+    """يرجّع (ds_train, ds_eval|None) من Parquet مع 'text' مُصيَّر (≤24K chars).
+
+    eval: اقتطاع stratified بنسبة eval_frac من كل source (قبل map)، مقصوص بmax_eval_records
+    لتخفيف GPU كلفة كل eval pass (eval كل 100 خطوة — يجب أن تبقى بدقائق لا ساعات)."""
     pf = pq.ParquetFile(parquet)
     n = pf.metadata.num_rows
     take_n = min(n, max_records or n)
     print(f"[data] {parquet}: {n:,} rows → taking {take_n:,}", flush=True)
-
-    # قراءة تدفّقية من parquet بياض الذاكرة، نمسك أول take_n من ترتيب الخلط المخزن
     ds = Dataset.from_parquet(parquet)
     ds = ds.take(take_n)
+
+    import collections
+    train_idx, eval_idx = list(range(len(ds))), []
+    if eval_frac > 0:
+        src = ds["source"]  # قراءة عمود صغيرة قبل إزالة stubs
+        by_src = collections.defaultdict(list)
+        for i, s in enumerate(src):
+            by_src[s].append(i)
+        rng = random.Random(seed + 777)
+        for _s, idxs in by_src.items():
+            eval_idx.extend(rng.sample(idxs, max(1, int(len(idxs) * eval_frac))))
+        if max_eval_records and len(eval_idx) > max_eval_records:
+            eval_idx = rng.sample(eval_idx, max_eval_records)
+        eval_set = set(eval_idx)
+        sel_counts = collections.defaultdict(int)
+        for i in eval_idx:
+            sel_counts[src[i]] += 1
+        print(f"[eval] stratified x{eval_frac:.3f} → eval={len(eval_idx):,}, "
+              f"train={len(train_idx) - len(eval_idx):,} per-source: {dict(sel_counts)}", flush=True)
 
     def _render(batch):
         texts, skipped = [], 0
@@ -142,9 +169,19 @@ def load_mix(parquet, token_budget, max_records, seed):
         STATS["skipped_toolshape"] += skipped
         return {"text": texts}
 
-    ds = ds.map(_render, batched=True, batch_size=256, num_proc=8,
-                remove_columns=[c for c in ds.column_names if c != "text"])
+    orig = ds  # المرجع الأصلي (بكل الأعمدة) — eval يُستخرج منه قبل التصيير
+    train_part = orig.select(train_idx) if eval_idx else orig
+    ds = train_part.map(_render, batched=True, batch_size=256, num_proc=8,
+                        remove_columns=[c for c in train_part.column_names if c != "text"])
     ds = ds.filter(lambda x: x["text"] is not None, num_proc=8)
+
+    eval_ds = None
+    if eval_idx:
+        raw_eval = orig.select(eval_idx)
+        eval_ds = raw_eval.map(_render, batched=True, batch_size=256, num_proc=8,
+                               remove_columns=[c for c in raw_eval.column_names if c != "text"])
+        eval_ds = eval_ds.filter(lambda x: x["text"] is not None, num_proc=8)
+        print(f"[eval] بعد التصيير: eval={len(eval_ds):,} سجل — متاح للpass", flush=True)
 
     if token_budget:
         # مختصر: استقصاء الرصيد بوفر (chars/3.5 ≈ tokens)
@@ -166,7 +203,7 @@ def load_mix(parquet, token_budget, max_records, seed):
     ds = ds.shuffle(seed=seed, keep_in_memory=False)
     print(f"[data] final training dataset: {len(ds):,} records, "
           f"~{sum(len(t) for t in ds['text'][:2000])/2000*len(ds)/1e9:.2f}GB chars", flush=True)
-    return ds
+    return ds, eval_ds
 
 
 def main():
@@ -192,11 +229,20 @@ def main():
     ap.add_argument("--torch-compile", action="store_true",
                     help="تفعيل torch.compile (رخيص التجربة — قد يفشل مع bnb)")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--save-steps", type=int, default=250)
+    ap.add_argument("--save-steps", type=int, default=100,
+                    help="مواءم مع eval_steps افتراضياً (شرط load_best_model_at_end)")
+    ap.add_argument("--eval-frac", type=float, default=0.07,
+                    help="حصة eval stratified بنسبة من كل source (0 يلغي)")
+    ap.add_argument("--max-eval-records", type=int, default=2000,
+                    help="سقف سجلات eval (اقتصاد pass — كل eval لا يمخ بجدول التدريب)")
+    ap.add_argument("--eval-steps", type=int, default=100)
+    ap.add_argument("--es-patience", type=int, default=3,
+                    help="EarlyStopping: عدد eval بدون تحسن قبل التوقف")
     ap.add_argument("--dry-run", action="store_true", help="التحقق من القالب والبيانات فقط")
     a = ap.parse_args()
 
-    ds = load_mix(a.parquet, a.token_budget, a.max_records, a.seed)
+    ds, eval_ds = load_mix(a.parquet, a.token_budget, a.max_records, a.seed,
+                           a.eval_frac, a.max_eval_records)
 
     # فحص قالب: 3 عينات (التباده لا يحتاج notice loader؛ unsloth يعيد tokenizer لاحقاً)
     for i in range(3):
@@ -268,13 +314,32 @@ def main():
         args.num_train_epochs = a.epochs
         args.warmup_steps = 40
 
+    callbacks = []  # LiveLossLogger لاحقاً
+    if eval_ds is not None and len(eval_ds) > 0:
+        # بوابة lora_gate: فرق "التعلم الحقيقي" عن "الحفظ" — قبل أي تشغيل طويل
+        args.eval_strategy = "steps"
+        args.eval_steps = a.eval_steps
+        args.metric_for_best_model = "eval_loss"
+        args.greater_is_better = False
+        args.load_best_model_at_end = True
+        args.per_device_eval_batch_size = 1
+        from transformers import EarlyStoppingCallback
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=a.es_patience))
+        print(f"[eval] مفعّل كل {a.eval_steps} خطوات ({len(eval_ds):,} سجل): "
+              f"best-keep + early-stop patience={a.es_patience}", flush=True)
+    else:
+        print("[eval] معطّل (eval_frac=0) — تحذير: لا حكم ضد الحفظ", flush=True)
+
+    callbacks.insert(0, LiveLossLogger(os.path.join(a.output, "loss_log.jsonl"),
+                                       a.max_length * a.grad_accum))
+
     trainer = SFTTrainer(
         model=model,
         args=args,
         train_dataset=ds,
+        eval_dataset=eval_ds,
         processing_class=tokenizer,
-        callbacks=[LiveLossLogger(os.path.join(a.output, "loss_log.jsonl"),
-                                  a.max_length * a.grad_accum)],
+        callbacks=callbacks,  # LiveLossLogger دقة أدناه
     )
     t0 = time.time()
     trainer.train()

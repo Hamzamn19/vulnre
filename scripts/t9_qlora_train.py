@@ -19,10 +19,10 @@ import time
 from pathlib import Path
 
 import pyarrow.parquet as pq
+import unsloth  # يجب قبل transformers/trl (patching إلزامي — خارطة unsloth)
+from unsloth import FastLanguageModel  # مسار t5_context_unsloth الذي نجح (قديم/ثالثة أسرع)
 from datasets import Dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
-                          TrainerCallback)
+from transformers import TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
 MODEL_ID = "models/deepseek-coder-6.7b-base"
@@ -182,11 +182,7 @@ def main():
 
     ds = load_mix(a.parquet, a.token_budget, a.max_records, a.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # فحص قالب: 3 عينات
+    # فحص قالب: 3 عينات (التباده لا يحتاج notice loader؛ unsloth يعيد tokenizer لاحقاً)
     for i in range(3):
         t = ds[i]["text"]
         print(f"[probe {i}] chars={len(t):,} head={t[:160]!r}… tail={t[-90:]!r}", flush=True)
@@ -195,30 +191,32 @@ def main():
         print("[dry-run] تم التحقق — لا تدريب.", flush=True)
         return
 
-    bnb = BitsAndBytesConfig(
+    print(f"[loader] unsloth FastLanguageModel (max_seq_length={a.max_length}); "
+          f"attn flag ignored — unsloth يدير الانتباه داخلياً", flush=True)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=MODEL_ID,
+        max_seq_length=a.max_length,
+        dtype=None,          # unsloth يختار bf16 تلقائياً (مدعوم على 3060)
         load_in_4bit=True,
-        bnb_4bit_compute_dtype="bfloat16",
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID, quantization_config=bnb, device_map="auto", trust_remote_code=True,
-        attn_implementation=a.attn)
-    model.config.use_cache = False
-    model = prepare_model_for_kbit_training(model)
 
     targets = (["q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj"]
                if a.lora_targets == "all" else ["q_proj", "v_proj"])  # qv = إعداد القياس الأصلي (6.72GB)
-    print(f"[lora] r={a.lora_r}, alpha={a.lora_r}, targets={a.lora_targets}", flush=True)
-    lora = LoraConfig(
-        r=a.lora_r, lora_alpha=a.lora_r, lora_dropout=0.05,  # alpha=r (احتياط رخيص — ليس حل مشكلة lora_gate الجوهرية: غياب eval)
+    print(f"[lora] r={a.lora_r}, alpha={a.lora_r}, targets={a.lora_targets}, "
+          f"ckpt=unsloth", flush=True)
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=a.lora_r,
+        lora_alpha=a.lora_r,  # alpha=r — توافق t5-unsloth الناجح (ليس حل مشكلة lora_gate: غياب eval)
+        lora_dropout=0,       # صفر كما في المسار الناجح (unsloth توصيته)
+        bias="none",
         target_modules=targets,
-        bias="none", task_type="CAUSAL_LM")
-    model = get_peft_model(model, lora)
+        use_gradient_checkpointing="unsloth",   # نسخة unsloth — أسرع وأخف من HF القياسية
+        random_state=a.seed,
+        max_seq_length=a.max_length,
+    )
     model.print_trainable_parameters()
-    import torch
-    print(f"[gpu] allocated {torch.cuda.memory_allocated(0)/1024**3:.2f}GB", flush=True)
 
     args = SFTConfig(
         output_dir=a.output,
@@ -233,8 +231,8 @@ def main():
         bf16=True,
         weight_decay=0.01,
         optim="paged_adamw_32bit",
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
+        # gradient_checkpointing: unsloth يديره عبر use_gradient_checkpointing="unsloth" —
+        # تفعيل هذا هنا سيطبق مرتين (unsloth + HF) فيضر الأداء/الذاكرة.
         max_length=a.max_length,
         packing=True,
         torch_compile=a.torch_compile,

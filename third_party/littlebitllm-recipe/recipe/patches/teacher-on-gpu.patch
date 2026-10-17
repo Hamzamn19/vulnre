@@ -1,0 +1,44 @@
+diff --git a/main.py b/main.py
+index d5f6810..d30ecb2 100644
+--- a/main.py
++++ b/main.py
+@@ -83,6 +83,9 @@ def get_args():
+ 
+     parser.add_argument("--use_itq", type=str2bool, default=False)
+     parser.add_argument("--itq_n_iter", type=int, default=50)
++    parser.add_argument("--teacher_offload", type=str2bool, default=True,
++                        help="True: teacher via DeepSpeed ZeRO-3 with CPU param offload (upstream). "
++                             "False: full bf16 teacher copy resident on each GPU (faster, needs VRAM).")
+ 
+     args = parser.parse_args()
+ 
+@@ -142,7 +145,29 @@ def load_student_model(args, device_map, torch_dtype):
+     return model
+ 
+ 
++def load_teacher_on_gpu(args, torch_dtype):
++    local_rank = int(os.environ.get("LOCAL_RANK", 0))
++    device = torch.device(f"cuda:{local_rank}")
++
++    teacher_model = AutoModelForCausalLM.from_pretrained(
++        args.model_id,
++        torch_dtype=torch_dtype,
++        low_cpu_mem_usage=True,
++        trust_remote_code=True,
++    ).to(device)
++    teacher_model.eval()
++    for param in teacher_model.parameters():
++        param.requires_grad = False
++    teacher_model.config.use_cache = False
++
++    logger.info(f"Teacher resident on {device} (no offload)")
++    return teacher_model
++
++
+ def load_teacher_model(args, num_gpus, torch_dtype, config_path="configs/zero3_inference.json"):
++    if not args.teacher_offload:
++        return load_teacher_on_gpu(args, torch_dtype)
++
+     with open(config_path, 'r') as f:
+         config = json.load(f)
+ 

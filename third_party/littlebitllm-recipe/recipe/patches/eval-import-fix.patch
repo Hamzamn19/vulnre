@@ -1,0 +1,20 @@
+diff --git a/eval.py b/eval.py
+index 446b1ed..84b3355 100644
+--- a/eval.py
++++ b/eval.py
+@@ -4,6 +4,15 @@ import json
+ import torch
+ import torch._dynamo
+ import torch.nn as nn
++
++# Import deepspeed before lm_eval/transformers (as main.py does). Otherwise
++# transformers.modeling_utils imports deepspeed mid-init and deepspeed's
++# import of transformers.models.opt hits a circular import.
++try:
++    import deepspeed  # noqa: F401
++except ImportError:
++    pass
++
+ from lm_eval import evaluator
+ from tqdm import tqdm
+ from transformers import AutoTokenizer, AutoModelForCausalLM

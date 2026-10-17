@@ -169,6 +169,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--lora-r", type=int, default=16)
+    ap.add_argument("--lora-targets", choices=["all", "qv"], default="all",
+                    help="all=7 إسقاطات (الخطي الحالي ~40M بارامتر)؛ qv=إعداد القياس الأصلي 6.72GB")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--save-steps", type=int, default=250)
     ap.add_argument("--dry-run", action="store_true", help="التحقق من القالب والبيانات فقط")
@@ -200,10 +202,13 @@ def main():
     model.config.use_cache = False
     model = prepare_model_for_kbit_training(model)
 
+    targets = (["q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj"]
+               if a.lora_targets == "all" else ["q_proj", "v_proj"])  # qv = إعداد القياس الأصلي (6.72GB)
+    print(f"[lora] r={a.lora_r}, alpha={a.lora_r}, targets={a.lora_targets}", flush=True)
     lora = LoraConfig(
         r=a.lora_r, lora_alpha=a.lora_r, lora_dropout=0.05,  # alpha=r (احتياط رخيص — ليس حل مشكلة lora_gate الجوهرية: غياب eval)
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
+        target_modules=targets,
         bias="none", task_type="CAUSAL_LM")
     model = get_peft_model(model, lora)
     model.print_trainable_parameters()

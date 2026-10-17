@@ -175,3 +175,13 @@
 - **منهجية جديدة معتمدة (نصه):** بايلوت القياس = **--max-steps 8-10 + --logging-steps 1**، الحساب من فرق الخطوة 3→8، والقراءة من bars مباشرة أو [timing] من on_log. أي بايلوت قادم للسرعة لا يتجاوز 10 خطوات (30 خطوة لقياس only تضييع). تمّ تنفيذه في LiveLossLogger: يطبع `[timing] steps X→Y: NNs/step, NN tok/s` في الstdout/log + rows في JSONL.
 - ⏹ `vulnre-t9-uns1` وُقف عند الخطوة ~7 (الأهداف القياسية مجرّة كلها؛ البقية تضييع حسب نصه).
 - بتوقيع الجوار: 8K على unsloth متوقعة محسوبة ~8-9GB VRAM (ضمن السعة) — القرار: pilot 8-10 خطوات للتحقق أم الانتقال للقرار النهائي (نافذة/نطاق) — عند المستخدم.
+
+## 2026-10-17 — بوابة lora_gate: eval stratified فعلي + بايلوت 8K unsloth (موافقة المستخدم)
+- تعليماته (بنصها): (1) eval_dataset اقتطاع 5-10% stratified + eval_steps=100 + EarlyStopping(patience=3) — **شرط قبل أي تشغيل طويل**، (2) بايلوت 8K+unsloth 10 خطوات (منهجية القياس السريع) للذاكرة والسرعة عند 8K، (3) ميزانية مرفوعة: **200-300M توكن** بنسب 40/35/20/5 وmax_steps صارم من tok/s الفعلي، (4) **لا تشغيل طويل إلا بعد تنفتل eval + تحقق قصير**.
+- ✅ التنفيذ (commit ‏«91+/26−»، dry-run سليم):
+  - `load_mix` يرجع (train, eval): ** stratified على source قبل تصييره** (5 مصادر نسبية بالالي: opencodeinstruct/bigvul/agent_flan/micro_self/html_cot) — سقف رخيص `--max-eval-records 2000` (كل eval pass يجب أن يبقى بدقائق لا ساعات — 7% من 1M حسníaّة تفاضة بالإثّره 100 خطوة).
+  - `SFTConfig`: eval_strategy="steps", eval_steps (100 افتراضي), metric_for_best_model="eval_loss", greater_is_better=False, load_best_model_at_end=True (+ شرطاً alignment: save_steps=eval_steps افتراضياً 100), EarlyStoppingCallback(patience=3), per_device_eval_batch_size=1.
+  - on_log يميّز صفوف eval: `[eval@S] eval_loss=…` مضغوط في stdout وJSONL (kind=eval) — لا يلوث timing.
+  - save_steps الافتراضي 250→100 (تواءمیات شرط transformers).
+- 🟢 **بايلوت T9-uns8k يعمل** (`vulnre-t9-uns8k`, 7200s): 10 خطوات، logging=1 (منهجية القياس 3→8)، eval كل 5، save كل 5، 8192@qv، 200K سجلات. متوقعة قياس: 8192×8 = 65,536 tok/خطوة؛ لو 537 tok/s ثابت عند 8K → ~122 s/خطوة وVRAM ~9-10GB.
+- ⛔ مشروطه: **ما يبدأ التشغيل الطويل حتى تُظهر وحدة حدّق eval أن (eval@5 وeval@10) طالعا بأشير سليم.**
